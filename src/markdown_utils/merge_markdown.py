@@ -1,7 +1,8 @@
 """
-merge-markdown - Compile a Markdown file by resolving transclusion directives.
+merge-markdown - Compile a Markdown file by resolving transclusion directives
+and {{var:name}} variable substitutions.
 
-Transclusion syntax:
+Transclusion syntax (must be the only thing on the line):
     {{relative/path/to/file.md}}          Sibling mode (auto demotion)
     {{relative/path/to/file.md|child}}    Child mode
     {{relative/path/to/file.md|N}}        Explicit top-level heading number
@@ -19,6 +20,17 @@ Demotion rules:
 Headings beyond level 6 are capped at level 6.
 Only ATX-style headings (lines beginning with #) are adjusted.
 Transclusions inside fenced code blocks are not processed.
+
+Variable syntax (may appear anywhere in a line, including inline in prose):
+    {{var:name}}
+
+Variables are resolved in a final pass over the fully-merged output (after
+every transclusion has been expanded), using a flat name -> value mapping
+loaded from a YAML file passed via --vars. This pass always runs, even when
+--vars is omitted (in which case the mapping is empty), so any {{var:...}}
+reference left in the compiled output is a hard error rather than a token
+that silently survives into the final document. Like transclusions,
+{{var:...}} references inside fenced code blocks are left untouched.
 """
 
 import argparse
@@ -26,10 +38,15 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
+
 
 # Matches a transclusion line (optional modifier after |).
 # The entire line (ignoring trailing whitespace) must be the directive.
 TRANSCLUSION_RE = re.compile(r'^\{\{([^|{}]+?)(?:\|([^}]*))?\}\}\s*$')
+
+# Matches a {{var:name}} reference anywhere within a line.
+VAR_RE = re.compile(r'\{\{var:([A-Za-z0-9_.-]+)\}\}')
 
 # Matches an ATX heading: one to six # chars followed by whitespace or end of line.
 HEADING_RE = re.compile(r'^(#{1,6})(?=\s|$)')
@@ -188,16 +205,98 @@ def process_file(file_path: Path, visited: frozenset | None = None) -> list[str]
     return result
 
 
+def substitute_variables(lines: list[str], variables: dict) -> list[str]:
+    """
+    Replace every {{var:name}} reference in `lines` with str(variables[name]).
+
+    Runs as a single pass over already-merged output, so a variable may be
+    referenced from any file in the transclusion tree. References inside
+    fenced code blocks are left untouched, matching transclusion behavior.
+
+    Any reference to a name not present in `variables` is collected and
+    reported as a hard error (exit code 1) rather than left in the output,
+    since a stray {{var:...}} token silently surviving into a compiled
+    prompt or document is a worse failure than stopping the build.
+    """
+    missing: set[str] = set()
+    result: list[str] = []
+
+    in_fence = False
+    fence_marker = ''
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in variables:
+            missing.add(name)
+            return match.group(0)
+        return str(variables[name])
+
+    for line in lines:
+        fence_match = FENCE_OPEN_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker[0] * len(marker)
+                result.append(line)
+                continue
+            elif line.strip() == marker[0] * len(line.strip()) and len(line.strip()) >= len(fence_marker) and marker[0] == fence_marker[0]:
+                in_fence = False
+                fence_marker = ''
+                result.append(line)
+                continue
+
+        if in_fence:
+            result.append(line)
+            continue
+
+        result.append(VAR_RE.sub(replace, line))
+
+    if missing:
+        names = ', '.join(sorted(missing))
+        print(f"Error: undefined variable(s) referenced: {names}", file=sys.stderr)
+        sys.exit(1)
+
+    return result
+
+
+def load_variables(vars_path: Path) -> dict:
+    if not vars_path.exists():
+        print(f"Error: Vars file '{vars_path}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        loaded = yaml.safe_load(vars_path.read_text(encoding='utf-8')) or {}
+    except yaml.YAMLError as exc:
+        print(f"Error: Could not parse vars file '{vars_path}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(loaded, dict):
+        print(f"Error: Vars file '{vars_path}' must contain a mapping at the top level.", file=sys.stderr)
+        sys.exit(1)
+
+    return loaded
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog='mergeMarkdown',
         description=(
-            'Compile a Markdown file by resolving {{transclusion}} directives. '
-            'Included files have their headings demoted to fit the surrounding context.'
+            'Compile a Markdown file by resolving {{transclusion}} directives '
+            'and {{var:name}} variables. Included files have their headings '
+            'demoted to fit the surrounding context.'
         ),
     )
     parser.add_argument('input', help='Source Markdown file to compile.')
     parser.add_argument('output', help='Destination file for the compiled output.')
+    parser.add_argument(
+        '-v', '--vars',
+        help=(
+            'Path to a YAML file of variables (flat name: value mapping) for '
+            '{{var:name}} substitution. If omitted, no variables are defined, '
+            'so any {{var:...}} reference in the compiled output is an error.'
+        ),
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -215,7 +314,10 @@ def main() -> None:
         print("Error: Input and output files must be different paths.", file=sys.stderr)
         sys.exit(1)
 
+    variables = load_variables(Path(args.vars)) if args.vars else {}
+
     result_lines = process_file(input_path)
+    result_lines = substitute_variables(result_lines, variables)
 
     try:
         output_path.write_text('\n'.join(result_lines) + '\n', encoding='utf-8')
