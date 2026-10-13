@@ -31,6 +31,13 @@ loaded from a YAML file passed via --vars. This pass always runs, even when
 reference left in the compiled output is a hard error rather than a token
 that silently survives into the final document. Like transclusions,
 {{var:...}} references inside fenced code blocks are left untouched.
+
+Library use:
+    merge_file(path, variables=None, strict=False) returns the compiled text.
+    With strict=True, a transclusion that cannot be resolved (missing file,
+    unreadable file, circular include) raises TransclusionError instead of
+    printing a warning and dropping the line. An undefined {{var:...}}
+    reference raises UndefinedVariableError. Both subclass MergeError.
 """
 
 import argparse
@@ -53,6 +60,29 @@ HEADING_RE = re.compile(r'^(#{1,6})(?=\s|$)')
 
 # Matches the opening of a fenced code block (``` or ~~~, with optional info string).
 FENCE_OPEN_RE = re.compile(r'^(`{3,}|~{3,})')
+
+
+class MergeError(Exception):
+    """Base class for errors raised while merging."""
+
+
+class TransclusionError(MergeError):
+    """A transclusion could not be resolved (raised only in strict mode)."""
+
+
+class UndefinedVariableError(MergeError):
+    """One or more {{var:name}} references have no value."""
+
+    def __init__(self, names):
+        self.names = sorted(names)
+        super().__init__(f"undefined variable(s) referenced: {', '.join(self.names)}")
+
+
+def _problem(message: str, strict: bool) -> None:
+    """Raise in strict mode; otherwise print a warning to stderr."""
+    if strict:
+        raise TransclusionError(message)
+    print(f"Warning: {message}; skipping.", file=sys.stderr)
 
 
 def get_heading_level(line: str) -> int:
@@ -89,13 +119,16 @@ def demote_headings(lines: list[str], demotion: int) -> list[str]:
     return result
 
 
-def process_file(file_path: Path, visited: frozenset | None = None) -> list[str]:
+def process_file(file_path: Path, visited: frozenset | None = None, strict: bool = False) -> list[str]:
     """
     Read `file_path`, resolve any transclusion directives, and return the
     resulting lines (no trailing newlines on individual lines).
 
     `visited` is a frozenset of resolved absolute paths already on the call
     stack, used to detect circular transclusions.
+
+    With `strict`, a circular, missing or unreadable transclusion raises
+    TransclusionError instead of being skipped with a warning.
     """
     if visited is None:
         visited = frozenset()
@@ -103,19 +136,16 @@ def process_file(file_path: Path, visited: frozenset | None = None) -> list[str]
     abs_path = file_path.resolve()
 
     if abs_path in visited:
-        print(
-            f"Warning: Circular transclusion detected for '{file_path}'; skipping.",
-            file=sys.stderr,
-        )
+        _problem(f"Circular transclusion detected for '{file_path}'", strict)
         return []
 
     try:
         text = file_path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        print(f"Warning: Transcluded file not found: '{file_path}'; skipping.", file=sys.stderr)
+        _problem(f"Transcluded file not found: '{file_path}'", strict)
         return []
     except OSError as exc:
-        print(f"Warning: Could not read '{file_path}': {exc}; skipping.", file=sys.stderr)
+        _problem(f"Could not read '{file_path}': {exc}", strict)
         return []
 
     visited = visited | {abs_path}
@@ -187,7 +217,7 @@ def process_file(file_path: Path, visited: frozenset | None = None) -> list[str]
                     demotion = max(current_level - 1, 0)
 
             # Recursively process the included file.
-            included_lines = process_file(Path(included_path), visited)
+            included_lines = process_file(Path(included_path), visited, strict)
 
             # Strip leading and trailing blank lines from included content.
             while included_lines and included_lines[0].strip() == '':
@@ -214,9 +244,9 @@ def substitute_variables(lines: list[str], variables: dict) -> list[str]:
     fenced code blocks are left untouched, matching transclusion behavior.
 
     Any reference to a name not present in `variables` is collected and
-    reported as a hard error (exit code 1) rather than left in the output,
-    since a stray {{var:...}} token silently surviving into a compiled
-    prompt or document is a worse failure than stopping the build.
+    raised as UndefinedVariableError rather than left in the output, since
+    a stray {{var:...}} token silently surviving into a compiled prompt or
+    document is a worse failure than stopping the build.
     """
     missing: set[str] = set()
     result: list[str] = []
@@ -253,11 +283,23 @@ def substitute_variables(lines: list[str], variables: dict) -> list[str]:
         result.append(VAR_RE.sub(replace, line))
 
     if missing:
-        names = ', '.join(sorted(missing))
-        print(f"Error: undefined variable(s) referenced: {names}", file=sys.stderr)
-        sys.exit(1)
+        raise UndefinedVariableError(missing)
 
     return result
+
+
+def merge_file(file_path, variables: dict | None = None, strict: bool = False) -> str:
+    """
+    Compile `file_path` (transclusions, then {{var:name}} substitution) and
+    return the result as text ending in a newline. Raises MergeError
+    subclasses on failure; see the module docstring.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        raise TransclusionError(f"File not found: '{path}'")
+    lines = process_file(path, strict=strict)
+    lines = substitute_variables(lines, variables or {})
+    return '\n'.join(lines) + '\n'
 
 
 def load_variables(vars_path: Path) -> dict:
@@ -297,6 +339,11 @@ def main() -> None:
             'so any {{var:...}} reference in the compiled output is an error.'
         ),
     )
+    parser.add_argument(
+        '--strict',
+        action='store_true',
+        help='Fail on a missing, unreadable or circular transclusion instead of skipping it.',
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -316,8 +363,12 @@ def main() -> None:
 
     variables = load_variables(Path(args.vars)) if args.vars else {}
 
-    result_lines = process_file(input_path)
-    result_lines = substitute_variables(result_lines, variables)
+    try:
+        result_lines = process_file(input_path, strict=args.strict)
+        result_lines = substitute_variables(result_lines, variables)
+    except MergeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         output_path.write_text('\n'.join(result_lines) + '\n', encoding='utf-8')
